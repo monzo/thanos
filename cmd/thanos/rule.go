@@ -45,6 +45,7 @@ import (
 	"github.com/prometheus/tsdb/labels"
 	"google.golang.org/grpc"
 	"gopkg.in/alecthomas/kingpin.v2"
+	"github.com/improbable-eng/thanos/pkg/discovery"
 )
 
 // registerRule registers a rule command.
@@ -76,6 +77,9 @@ func registerRule(m map[string]setupFunc, app *kingpin.Application, name string)
 	bucketConfFile := cmd.Flag("objstore.config-file", "The object store configuration file path.").
 		PlaceHolder("<bucket.config.path>").String()
 
+	filesToWatch := cmd.Flag("filesd", "Path to file that contain addresses of query peers (repeatable).").
+		PlaceHolder("<path>").Strings()
+
 	m[name] = func(g *run.Group, logger log.Logger, reg *prometheus.Registry, tracer opentracing.Tracer, _ bool) error {
 		lset, err := parseFlagLabels(*labelStrs)
 		if err != nil {
@@ -97,6 +101,16 @@ func registerRule(m map[string]setupFunc, app *kingpin.Application, name string)
 			NoLockfile:       true,
 			WALFlushInterval: 30 * time.Second,
 		}
+
+		var filesd *discovery.FileDiscoverer
+		if len(*filesToWatch) > 0 {
+			conf := &discovery.SDConfig{
+				Files: *filesToWatch,
+				RefreshInterval: 5 * time.Second,
+			}
+			filesd = discovery.NewFileDiscoverer(conf, logger)
+		}
+
 		return runRule(g,
 			logger,
 			reg,
@@ -116,6 +130,7 @@ func registerRule(m map[string]setupFunc, app *kingpin.Application, name string)
 			tsdbOpts,
 			name,
 			alertQueryURL,
+			filesd,
 		)
 	}
 }
@@ -142,6 +157,7 @@ func runRule(
 	tsdbOpts *tsdb.Options,
 	component string,
 	alertQueryURL *url.URL,
+	fileSD *discovery.FileDiscoverer,
 ) error {
 	configSuccess := prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "thanos_config_last_reload_successful",
@@ -169,9 +185,15 @@ func runRule(
 		})
 	}
 
+	// FileSD query addresses
+	addrFromFileSD := newFileSDAddrs()
+
 	// Hit the HTTP query API of query peers in randomized order until we get a result
 	// back or the context get canceled.
 	queryFn := func(ctx context.Context, q string, t time.Time) (promql.Vector, error) {
+		var addrs []string
+
+		// Add addresses from gossip
 		peers := peer.PeerStates(cluster.PeerTypeQuery)
 		var ids []string
 		for id := range peers {
@@ -180,9 +202,19 @@ func runRule(
 		sort.Slice(ids, func(i int, j int) bool {
 			return strings.Compare(ids[i], ids[j]) < 0
 		})
+		for _, id := range ids {
+			addrs = append(addrs, peers[id].QueryAPIAddr)
+		}
 
-		for _, i := range rand.Perm(len(ids)) {
-			vec, err := queryPrometheusInstant(ctx, logger, peers[ids[i]].QueryAPIAddr, q, t)
+		// Add addresses from file sd
+		addrFromFileSD.mtx.Lock()
+		for _, fsdAddrs := range addrFromFileSD.addrs {
+			addrs = append(addrs, fsdAddrs...)
+		}
+		addrFromFileSD.mtx.Unlock()
+
+		for _, i := range rand.Perm(len(addrs)) {
+			vec, err := queryPrometheusInstant(ctx, logger, addrs[i], q, t)
 			if err != nil {
 				return nil, err
 			}
@@ -301,6 +333,46 @@ func runRule(
 		}, func(error) {
 			cancel()
 		})
+	}
+	// Run File Service Discovery and update the query addresses when the files are modified
+	{
+		if fileSD != nil {
+			var fileSDUpdates chan *discovery.Discoverable
+			ctx, cancel := context.WithCancel(context.Background())
+
+			fileSDUpdates = make(chan *discovery.Discoverable)
+
+			g.Add(func() error {
+				fileSD.Run(ctx, fileSDUpdates)
+				return nil
+			}, func(error) {
+				cancel()
+			})
+
+			g.Add(func() error {
+				for {
+					select {
+					case update, ok := <-fileSDUpdates:
+						// Handle the case that a discoverer exits and closes the channel
+						// before the context is done.
+						if !ok {
+							return nil
+						}
+						// Discoverers sometimes send nil updates so need to check for it to avoid panics
+						if update == nil {
+							continue
+						}
+						// TODO(ivan): resolve dns here maybe?
+						addrFromFileSD.update(update.Source, update.Services)
+					case <-ctx.Done():
+						return nil
+					}
+				}
+			}, func(error) {
+				cancel()
+				close(fileSDUpdates)
+			})
+		}
 	}
 
 	// Handle reload and termination interrupts.

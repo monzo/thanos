@@ -131,5 +131,7 @@ Flags:
                                  in all alerts 'Source' field
       --objstore.config-file=<bucket.config.path>  
                                  The object store configuration file path.
+      --filesd=<path> ...        Path to file that contain addresses of query
+                                 peers (repeatable).
 
 ```
