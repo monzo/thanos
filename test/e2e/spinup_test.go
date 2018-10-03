@@ -7,12 +7,15 @@ import (
 	"io/ioutil"
 	"os"
 	"os/exec"
-	"path"
 	"syscall"
 	"testing"
 	"time"
 
 	"github.com/improbable-eng/thanos/pkg/testutil"
+
+	"path"
+
+	"encoding/json"
 
 	"github.com/oklog/run"
 	"github.com/pkg/errors"
@@ -46,6 +49,13 @@ type config struct {
 	queriesReplicaLabel string
 	numRules            int
 	numAlertmanagers    int
+	sdConfig            sdConfig
+}
+
+type sdConfig struct {
+	useGossip           bool
+	useStaticStoresFlag bool
+	useFileSD           bool
 }
 
 func evalClusterPeersFlags(cfg config) []string {
@@ -87,41 +97,78 @@ func spinup(t testing.TB, ctx context.Context, cfg config) (chan error, error) {
 			"--log.level", "info",
 			"--web.listen-address", promHTTP(i),
 		))
-		commands = append(commands, exec.Command("thanos",
-			append([]string{
-				"sidecar",
-				"--debug.name", fmt.Sprintf("sidecar-%d", i),
-				"--grpc-address", sidecarGRPC(i),
-				"--http-address", sidecarHTTP(i),
-				"--prometheus.url", fmt.Sprintf("http://%s", promHTTP(i)),
-				"--tsdb.path", promDir,
-				"--cluster.address", sidecarCluster(i),
-				"--cluster.advertise-address", sidecarCluster(i),
-				"--cluster.gossip-interval", "200ms",
-				"--cluster.pushpull-interval", "200ms",
-				"--log.level", "debug",
-			},
-				clusterPeers...)...,
-		))
+
+		args := []string{
+			"sidecar",
+			"--debug.name", fmt.Sprintf("sidecar-%d", i),
+			"--grpc-address", sidecarGRPC(i),
+			"--http-address", sidecarHTTP(i),
+			"--prometheus.url", fmt.Sprintf("http://%s", promHTTP(i)),
+			"--tsdb.path", promDir,
+			"--log.level", "debug",
+		}
+		args = append(args, []string{
+			"--cluster.address", sidecarCluster(i),
+			"--cluster.advertise-address", sidecarCluster(i),
+			"--cluster.gossip-interval", "200ms",
+			"--cluster.pushpull-interval", "200ms"}...)
+		args = append(args, clusterPeers...)
+
+		commands = append(commands, exec.Command("thanos", args...))
 
 		time.Sleep(200 * time.Millisecond)
 	}
 
 	for i := 1; i <= cfg.numQueries; i++ {
-		commands = append(commands, exec.Command("thanos",
-			append([]string{"query",
-				"--debug.name", fmt.Sprintf("query-%d", i),
-				"--grpc-address", queryGRPC(i),
-				"--http-address", queryHTTP(i),
+		args := []string{
+			"query",
+			"--debug.name", fmt.Sprintf("query-%d", i),
+			"--grpc-address", queryGRPC(i),
+			"--http-address", queryHTTP(i),
+			"--log.level", "debug",
+			"--query.replica-label", cfg.queriesReplicaLabel,
+		}
+
+		if cfg.sdConfig.useGossip {
+			args = append(args, []string{
 				"--cluster.address", queryCluster(i),
 				"--cluster.advertise-address", queryCluster(i),
 				"--cluster.gossip-interval", "200ms",
 				"--cluster.pushpull-interval", "200ms",
-				"--log.level", "debug",
-				"--query.replica-label", cfg.queriesReplicaLabel,
-			},
-				clusterPeers...)...,
-		))
+			}...)
+			args = append(args, clusterPeers...)
+		} else {
+			args = append(args, "--no-gossip")
+		}
+
+		if cfg.sdConfig.useStaticStoresFlag {
+			for k := range cfg.promConfigs {
+				args = append(args, "--store", sidecarGRPC(k+1))
+			}
+		}
+
+		if cfg.sdConfig.useFileSD {
+			queryFileSDDir := fmt.Sprintf("%s/data/queryFileSd%d", cfg.workDir, i)
+			if err := os.MkdirAll(queryFileSDDir, 0777); err != nil {
+				return nil, errors.Wrap(err, "creating query filesd dir failed")
+			}
+			addrs := []string{}
+			for k := range cfg.promConfigs {
+				addrs = append(addrs, sidecarGRPC(k+1))
+			}
+			json, err := json.Marshal(addrs)
+			if err != nil {
+				return nil, errors.Wrap(err, "encoding filesd failed")
+			}
+			err = ioutil.WriteFile(queryFileSDDir+"/filesd.json", json, 0666)
+			if err != nil {
+				return nil, errors.Wrap(err, "creating ruler file failed")
+			}
+
+			args = append(args, "--filesd", path.Join(queryFileSDDir, "filesd.json"))
+		}
+
+		commands = append(commands, exec.Command("thanos", args...))
 		time.Sleep(200 * time.Millisecond)
 	}
 
@@ -136,24 +183,28 @@ func spinup(t testing.TB, ctx context.Context, cfg config) (chan error, error) {
 			return nil, errors.Wrap(err, "creating ruler file failed")
 		}
 
-		commands = append(commands, exec.Command("thanos",
-			append([]string{"rule",
-				"--debug.name", fmt.Sprintf("rule-%d", i),
-				"--label", fmt.Sprintf(`replica="%d"`, i),
-				"--data-dir", dbDir,
-				"--rule-file", path.Join(dbDir, "*.yaml"),
-				"--eval-interval", "1s",
-				"--alertmanagers.url", "http://127.0.0.1:29093",
-				"--grpc-address", rulerGRPC(i),
-				"--http-address", rulerHTTP(i),
-				"--cluster.address", rulerCluster(i),
-				"--cluster.advertise-address", rulerCluster(i),
-				"--cluster.gossip-interval", "200ms",
-				"--cluster.pushpull-interval", "200ms",
-				"--log.level", "debug",
-			},
-				clusterPeers...)...,
-		))
+		args := []string{
+			"rule",
+			"--debug.name", fmt.Sprintf("rule-%d", i),
+			"--label", fmt.Sprintf(`replica="%d"`, i),
+			"--data-dir", dbDir,
+			"--rule-file", path.Join(dbDir, "*.yaml"),
+			"--eval-interval", "1s",
+			"--alertmanagers.url", "http://127.0.0.1:29093",
+			"--grpc-address", rulerGRPC(i),
+			"--http-address", rulerHTTP(i),
+			"--log.level", "debug",
+		}
+		args = append(args, []string{
+			"--cluster.address", rulerCluster(i),
+			"--cluster.advertise-address", rulerCluster(i),
+			"--cluster.gossip-interval", "200ms",
+			"--cluster.pushpull-interval", "200ms",
+		}...)
+		args = append(args, clusterPeers...)
+
+		commands = append(commands, exec.Command("thanos", args...))
+
 		time.Sleep(200 * time.Millisecond)
 	}
 

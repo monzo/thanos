@@ -11,11 +11,14 @@ import (
 	"net/http"
 	"time"
 
+	"sync"
+
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 	"github.com/grpc-ecosystem/go-grpc-middleware"
 	"github.com/grpc-ecosystem/go-grpc-prometheus"
 	"github.com/improbable-eng/thanos/pkg/cluster"
+	"github.com/improbable-eng/thanos/pkg/discovery"
 	"github.com/improbable-eng/thanos/pkg/query"
 	"github.com/improbable-eng/thanos/pkg/query/api"
 	"github.com/improbable-eng/thanos/pkg/runutil"
@@ -33,15 +36,13 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"gopkg.in/alecthomas/kingpin.v2"
-	"github.com/improbable-eng/thanos/pkg/discovery"
-	"sync"
 )
 
 // registerQuery registers a query command.
 func registerQuery(m map[string]setupFunc, app *kingpin.Application, name string) {
 	cmd := app.Command(name, "query node exposing PromQL enabled Query API with data retrieved from multiple store nodes")
 
-	grpcBindAddr, httpBindAddr, srvCert, srvKey, srvClientCA, newPeerFn := regCommonServerFlags(cmd)
+	grpcBindAddr, httpBindAddr, srvCert, srvKey, srvClientCA, disableGossip, newPeerFn := regCommonServerFlags(cmd)
 
 	httpAdvertiseAddr := cmd.Flag("http-advertise-address", "Explicit (external) host:port address to advertise for HTTP QueryAPI in gossip cluster. If empty, 'http-address' will be used.").
 		String()
@@ -73,9 +74,13 @@ func registerQuery(m map[string]setupFunc, app *kingpin.Application, name string
 		Default("false").Bool()
 
 	m[name] = func(g *run.Group, logger log.Logger, reg *prometheus.Registry, tracer opentracing.Tracer, _ bool) error {
-		peer, err := newPeerFn(logger, reg, true, *httpAdvertiseAddr, true)
-		if err != nil {
-			return errors.Wrap(err, "new cluster peer")
+		var peer *cluster.Peer
+		var err error
+		if !*disableGossip {
+			peer, err = newPeerFn(logger, reg, true, *httpAdvertiseAddr, true)
+			if err != nil {
+				return errors.Wrap(err, "new cluster peer")
+			}
 		}
 		selectorLset, err := parseFlagLabels(*selectorLabels)
 		if err != nil {
@@ -94,7 +99,7 @@ func registerQuery(m map[string]setupFunc, app *kingpin.Application, name string
 		var filesd *discovery.FileDiscoverer
 		if len(*filesToWatch) > 0 {
 			conf := &discovery.SDConfig{
-				Files: *filesToWatch,
+				Files:           *filesToWatch,
 				RefreshInterval: 5 * time.Second,
 			}
 			filesd = discovery.NewFileDiscoverer(conf, logger)
@@ -122,6 +127,7 @@ func registerQuery(m map[string]setupFunc, app *kingpin.Application, name string
 			*stores,
 			*enableAutodownsampling,
 			filesd,
+			*disableGossip,
 		)
 	}
 }
@@ -227,6 +233,7 @@ func runQuery(
 	storeAddrs []string,
 	enableAutodownsampling bool,
 	fileSD *discovery.FileDiscoverer,
+	disableGossip bool,
 ) error {
 	var staticSpecs []query.StoreSpec
 	for _, addr := range storeAddrs {
@@ -250,13 +257,16 @@ func runQuery(
 			reg,
 			func() (specs []query.StoreSpec) {
 				specs = append(staticSpecs)
-				for id, ps := range peer.PeerStates(cluster.PeerTypesStoreAPIs()...) {
-					if ps.StoreAPIAddr == "" {
-						level.Error(logger).Log("msg", "Gossip found peer that propagates empty address, ignoring.", "lset", fmt.Sprintf("%v", ps.Metadata.Labels))
-						continue
-					}
 
-					specs = append(specs, &gossipSpec{id: id, addr: ps.StoreAPIAddr, peer: peer})
+				if !disableGossip {
+					for id, ps := range peer.PeerStates(cluster.PeerTypesStoreAPIs()...) {
+						if ps.StoreAPIAddr == "" {
+							level.Error(logger).Log("msg", "Gossip found peer that propagates empty address, ignoring.", "lset", fmt.Sprintf("%v", ps.Metadata.Labels))
+							continue
+						}
+
+						specs = append(specs, &gossipSpec{id: id, addr: ps.StoreAPIAddr, peer: peer})
+					}
 				}
 
 				addrFromFileSD.mtx.Lock()
@@ -333,19 +343,21 @@ func runQuery(
 		}
 	}
 	{
-		ctx, cancel := context.WithCancel(context.Background())
-		g.Add(func() error {
-			// New gossip cluster.
-			if err := peer.Join(cluster.PeerTypeQuery, cluster.PeerMetadata{}); err != nil {
-				return errors.Wrap(err, "join cluster")
-			}
+		if !disableGossip {
+			ctx, cancel := context.WithCancel(context.Background())
+			g.Add(func() error {
+				// New gossip cluster.
+				if err := peer.Join(cluster.PeerTypeQuery, cluster.PeerMetadata{}); err != nil {
+					return errors.Wrap(err, "join cluster")
+				}
 
-			<-ctx.Done()
-			return nil
-		}, func(error) {
-			cancel()
-			peer.Close(5 * time.Second)
-		})
+				<-ctx.Done()
+				return nil
+			}, func(error) {
+				cancel()
+				peer.Close(5 * time.Second)
+			})
+		}
 	}
 	// Start query API + UI HTTP server.
 	{
@@ -410,7 +422,7 @@ type gossipSpec struct {
 
 type fileSDAddrs struct {
 	addrs map[string][]string
-	mtx sync.Mutex
+	mtx   sync.Mutex
 }
 
 func newFileSDAddrs() *fileSDAddrs {

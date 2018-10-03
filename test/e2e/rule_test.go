@@ -46,6 +46,12 @@ groups:
 		numRules:         2,
 		numAlertmanagers: 1,
 		rules:            alwaysFireRule,
+		// sd config that mimics the previous behaviour. This config is properly used in the next PR
+		sdConfig: sdConfig{
+			useGossip:           true,
+			useStaticStoresFlag: false,
+			useFileSD:           false,
+		},
 	})
 	if err != nil {
 		t.Errorf("spinup failed: %v", err)

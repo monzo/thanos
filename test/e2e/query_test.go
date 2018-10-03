@@ -17,9 +17,38 @@ import (
 	"github.com/prometheus/common/model"
 )
 
+func TestQuery(t *testing.T) {
+	for name, conf := range map[string]sdConfig{
+		"onlyGossip": {
+			useGossip:           true,
+			useStaticStoresFlag: false,
+			useFileSD:           false,
+		},
+		"onlyStaticFlags": {
+			useGossip:           false,
+			useStaticStoresFlag: true,
+			useFileSD:           false,
+		},
+		"onlyFileSD": {
+			useGossip:           false,
+			useStaticStoresFlag: false,
+			useFileSD:           true,
+		},
+		"all": {
+			useGossip:           true,
+			useStaticStoresFlag: true,
+			useFileSD:           true,
+		},
+	} {
+		//TODO(ivan): delete this
+		fmt.Printf("Starting TestQuerySimple with service discovery: %v\n", name)
+		testQuerySimple(t, conf)
+	}
+}
+
 // TestQuerySimple runs a setup of Prometheus servers, sidecars, and query nodes and verifies that
 // queries return data merged from all Prometheus servers. Additionally it verifies if deduplication works for query.
-func TestQuerySimple(t *testing.T) {
+func testQuerySimple(t *testing.T, sdConfig sdConfig) {
 	dir, err := ioutil.TempDir("", "test_query_simple")
 	testutil.Ok(t, err)
 	defer func() { testutil.Ok(t, os.RemoveAll(dir)) }()
@@ -72,7 +101,9 @@ scrape_configs:
 		workDir:             dir,
 		numQueries:          2,
 		queriesReplicaLabel: "replica",
+		sdConfig:            sdConfig,
 	})
+
 	if err != nil {
 		t.Errorf("spinup failed: %v", err)
 		cancel()
