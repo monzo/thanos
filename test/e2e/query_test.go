@@ -40,8 +40,7 @@ func TestQuery(t *testing.T) {
 			useFileSD:           true,
 		},
 	} {
-		//TODO(ivan): delete this
-		fmt.Printf("Starting TestQuerySimple with service discovery: %v\n", name)
+		fmt.Printf("Starting TestQuerySimple with service discovery: %v ...\n", name)
 		testQuerySimple(t, conf)
 	}
 }

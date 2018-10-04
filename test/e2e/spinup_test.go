@@ -145,6 +145,9 @@ func spinup(t testing.TB, ctx context.Context, cfg config) (chan error, error) {
 			for k := range cfg.promConfigs {
 				args = append(args, "--store", sidecarGRPC(k+1))
 			}
+			for k := 0; k < cfg.numRules; k++ {
+				args = append(args, "--store", rulerGRPC(k+1))
+			}
 		}
 
 		if cfg.sdConfig.useFileSD {
@@ -155,6 +158,9 @@ func spinup(t testing.TB, ctx context.Context, cfg config) (chan error, error) {
 			addrs := []string{}
 			for k := range cfg.promConfigs {
 				addrs = append(addrs, sidecarGRPC(k+1))
+			}
+			for k := 0; k < cfg.numRules; k++ {
+				addrs = append(addrs, rulerGRPC(k+1))
 			}
 			json, err := json.Marshal(addrs)
 			if err != nil {
@@ -195,13 +201,44 @@ func spinup(t testing.TB, ctx context.Context, cfg config) (chan error, error) {
 			"--http-address", rulerHTTP(i),
 			"--log.level", "debug",
 		}
-		args = append(args, []string{
-			"--cluster.address", rulerCluster(i),
-			"--cluster.advertise-address", rulerCluster(i),
-			"--cluster.gossip-interval", "200ms",
-			"--cluster.pushpull-interval", "200ms",
-		}...)
-		args = append(args, clusterPeers...)
+		if cfg.sdConfig.useGossip {
+			args = append(args, []string{
+				"--cluster.address", rulerCluster(i),
+				"--cluster.advertise-address", rulerCluster(i),
+				"--cluster.gossip-interval", "200ms",
+				"--cluster.pushpull-interval", "200ms",
+			}...)
+			args = append(args, clusterPeers...)
+		} else {
+			args = append(args, "--no-gossip")
+		}
+
+		if cfg.sdConfig.useFileSD {
+			ruleFileSDDir := fmt.Sprintf("%s/data/ruleFileSd%d", cfg.workDir, i)
+			if err := os.MkdirAll(ruleFileSDDir, 0777); err != nil {
+				return nil, errors.Wrap(err, "creating rule filesd dir failed")
+			}
+			addrs := []string{}
+			for k := 0; k < cfg.numQueries; k++ {
+				addrs = append(addrs, queryHTTP(k+1))
+			}
+			json, err := json.Marshal(addrs)
+			if err != nil {
+				return nil, errors.Wrap(err, "encoding filesd failed")
+			}
+			err = ioutil.WriteFile(ruleFileSDDir+"/filesd.json", json, 0666)
+			if err != nil {
+				return nil, errors.Wrap(err, "creating ruler file failed")
+			}
+
+			args = append(args, "--filesd", path.Join(ruleFileSDDir, "filesd.json"))
+		}
+
+		if cfg.sdConfig.useStaticStoresFlag {
+			for k := 0; k < cfg.numQueries; k++ {
+				args = append(args, "--query", queryHTTP(k+1))
+			}
+		}
 
 		commands = append(commands, exec.Command("thanos", args...))
 

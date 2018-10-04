@@ -277,6 +277,10 @@ func runQuery(
 					}
 				}
 
+				for _, a := range specs {
+					fmt.Printf("Spec: %v\n", a.Addr())
+				}
+
 				return specs
 			},
 			dialOpts,

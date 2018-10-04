@@ -24,6 +24,7 @@ import (
 	"github.com/improbable-eng/thanos/pkg/alert"
 	"github.com/improbable-eng/thanos/pkg/block"
 	"github.com/improbable-eng/thanos/pkg/cluster"
+	"github.com/improbable-eng/thanos/pkg/discovery"
 	"github.com/improbable-eng/thanos/pkg/objstore/client"
 	"github.com/improbable-eng/thanos/pkg/runutil"
 	"github.com/improbable-eng/thanos/pkg/shipper"
@@ -45,14 +46,13 @@ import (
 	"github.com/prometheus/tsdb/labels"
 	"google.golang.org/grpc"
 	"gopkg.in/alecthomas/kingpin.v2"
-	"github.com/improbable-eng/thanos/pkg/discovery"
 )
 
 // registerRule registers a rule command.
 func registerRule(m map[string]setupFunc, app *kingpin.Application, name string) {
 	cmd := app.Command(name, "ruler evaluating Prometheus rules against given Query nodes, exposing Store API and storing old blocks in bucket")
 
-	grpcBindAddr, httpBindAddr, cert, key, clientCA, _, newPeerFn := regCommonServerFlags(cmd)
+	grpcBindAddr, httpBindAddr, cert, key, clientCA, disableGossip, newPeerFn := regCommonServerFlags(cmd)
 
 	labelStrs := cmd.Flag("label", "Labels to be applied to all generated metrics (repeated).").
 		PlaceHolder("<name>=\"<value>\"").Strings()
@@ -68,7 +68,7 @@ func registerRule(m map[string]setupFunc, app *kingpin.Application, name string)
 		Default("2h"))
 	tsdbRetention := modelDuration(cmd.Flag("tsdb.retention", "Block retention time on local disk.").
 		Default("48h"))
-
+	//TODO(ivan): add alertmanagers urls to file sd
 	alertmgrs := cmd.Flag("alertmanagers.url", "Alertmanager URLs to push firing alerts to. The scheme may be prefixed with 'dns+' or 'dnssrv+' to detect Alertmanager IPs through respective DNS lookups. The port defaults to 9093 or the SRV record's value. The URL path is used as a prefix for the regular Alertmanager API path.").
 		Strings()
 
@@ -79,7 +79,7 @@ func registerRule(m map[string]setupFunc, app *kingpin.Application, name string)
 
 	queries := cmd.Flag("query", "Addresses of statically configured query API servers (repeatable).").
 		PlaceHolder("<query>").Strings()
-
+	//TODO(ivan): flag name? maybe query-filesd, because now it's used only for finding queriers
 	filesToWatch := cmd.Flag("filesd", "Path to file that contain addresses of query peers (repeatable).").
 		PlaceHolder("<path>").Strings()
 
@@ -88,9 +88,12 @@ func registerRule(m map[string]setupFunc, app *kingpin.Application, name string)
 		if err != nil {
 			return errors.Wrap(err, "parse labels")
 		}
-		peer, err := newPeerFn(logger, reg, false, "", false)
-		if err != nil {
-			return errors.Wrap(err, "new cluster peer")
+		var peer *cluster.Peer
+		if !*disableGossip {
+			peer, err = newPeerFn(logger, reg, false, "", false)
+			if err != nil {
+				return errors.Wrap(err, "new cluster peer")
+			}
 		}
 		alertQueryURL, err := url.Parse(*alertQueryURL)
 		if err != nil {
@@ -117,7 +120,7 @@ func registerRule(m map[string]setupFunc, app *kingpin.Application, name string)
 		var filesd *discovery.FileDiscoverer
 		if len(*filesToWatch) > 0 {
 			conf := &discovery.SDConfig{
-				Files: *filesToWatch,
+				Files:           *filesToWatch,
 				RefreshInterval: 5 * time.Second,
 			}
 			filesd = discovery.NewFileDiscoverer(conf, logger)
@@ -144,6 +147,7 @@ func registerRule(m map[string]setupFunc, app *kingpin.Application, name string)
 			alertQueryURL,
 			*queries,
 			filesd,
+			*disableGossip,
 		)
 	}
 }
@@ -172,6 +176,7 @@ func runRule(
 	alertQueryURL *url.URL,
 	queryAddrs []string,
 	fileSD *discovery.FileDiscoverer,
+	disableGossip bool,
 ) error {
 	configSuccess := prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "thanos_config_last_reload_successful",
@@ -216,16 +221,18 @@ func runRule(
 		addrs = append(addrs, queryAddrs...)
 
 		// Add addresses from gossip
-		peers := peer.PeerStates(cluster.PeerTypeQuery)
-		var ids []string
-		for id := range peers {
-			ids = append(ids, id)
-		}
-		sort.Slice(ids, func(i int, j int) bool {
-			return strings.Compare(ids[i], ids[j]) < 0
-		})
-		for _, id := range ids {
-			addrs = append(addrs, peers[id].QueryAPIAddr)
+		if !disableGossip {
+			peers := peer.PeerStates(cluster.PeerTypeQuery)
+			var ids []string
+			for id := range peers {
+				ids = append(ids, id)
+			}
+			sort.Slice(ids, func(i int, j int) bool {
+				return strings.Compare(ids[i], ids[j]) < 0
+			})
+			for _, id := range ids {
+				addrs = append(addrs, peers[id].QueryAPIAddr)
+			}
 		}
 
 		// Add addresses from file sd
@@ -296,30 +303,32 @@ func runRule(
 		})
 	}
 	{
-		var storeLset []storepb.Label
-		for _, l := range lset {
-			storeLset = append(storeLset, storepb.Label{Name: l.Name, Value: l.Value})
-		}
-
-		ctx, cancel := context.WithCancel(context.Background())
-		g.Add(func() error {
-			// New gossip cluster.
-			if err = peer.Join(cluster.PeerTypeSource, cluster.PeerMetadata{
-				Labels: storeLset,
-				// Start out with the full time range. The shipper will constrain it later.
-				// TODO(fabxc): minimum timestamp is never adjusted if shipping is disabled.
-				MinTime: 0,
-				MaxTime: math.MaxInt64,
-			}); err != nil {
-				return errors.Wrap(err, "join cluster")
+		if !disableGossip {
+			var storeLset []storepb.Label
+			for _, l := range lset {
+				storeLset = append(storeLset, storepb.Label{Name: l.Name, Value: l.Value})
 			}
 
-			<-ctx.Done()
-			return nil
-		}, func(error) {
-			cancel()
-			peer.Close(5 * time.Second)
-		})
+			ctx, cancel := context.WithCancel(context.Background())
+			g.Add(func() error {
+				// New gossip cluster.
+				if err = peer.Join(cluster.PeerTypeSource, cluster.PeerMetadata{
+					Labels: storeLset,
+					// Start out with the full time range. The shipper will constrain it later.
+					// TODO(fabxc): minimum timestamp is never adjusted if shipping is disabled.
+					MinTime: 0,
+					MaxTime: math.MaxInt64,
+				}); err != nil {
+					return errors.Wrap(err, "join cluster")
+				}
+
+				<-ctx.Done()
+				return nil
+			}, func(error) {
+				cancel()
+				peer.Close(5 * time.Second)
+			})
+		}
 	}
 	{
 		sdr := alert.NewSender(logger, reg, alertmgrs.get, nil)
@@ -546,7 +555,9 @@ func runRule(
 				if err != nil {
 					level.Warn(logger).Log("msg", "reading timestamps failed", "err", err)
 				} else {
-					peer.SetTimestamps(minTime, math.MaxInt64)
+					if !disableGossip {
+						peer.SetTimestamps(minTime, math.MaxInt64)
+					}
 				}
 				return nil
 			})
@@ -555,7 +566,10 @@ func runRule(
 		})
 	}
 
-	level.Info(logger).Log("msg", "starting rule node", "peer", peer.Name())
+	if !disableGossip {
+		level.Info(logger).Log("msg", "starting rule node", "peer", peer.Name())
+	}
+	
 	return nil
 }
 

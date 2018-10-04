@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"fmt"
+
 	"github.com/improbable-eng/thanos/pkg/runutil"
 	"github.com/improbable-eng/thanos/pkg/testutil"
 	"github.com/pkg/errors"
@@ -17,11 +19,39 @@ import (
 	"github.com/prometheus/prometheus/pkg/timestamp"
 )
 
+func TestRule(t *testing.T) {
+	for name, conf := range map[string]sdConfig{
+		"onlyGossip": {
+			useGossip:           true,
+			useStaticStoresFlag: false,
+			useFileSD:           false,
+		},
+		"onlyStaticFlags": {
+			useGossip:           false,
+			useStaticStoresFlag: true,
+			useFileSD:           false,
+		},
+		"onlyFileSD": {
+			useGossip:           false,
+			useStaticStoresFlag: false,
+			useFileSD:           true,
+		},
+		"all": {
+			useGossip:           true,
+			useStaticStoresFlag: true,
+			useFileSD:           true,
+		},
+	} {
+		fmt.Printf("Starting TestRuleComponent with service discovery: %v ...\n", name)
+		testRuleComponent(t, conf)
+	}
+}
+
 // TestRuleComponent tests the basic interaction between the rule component
 // and the querying layer.
 // Rules are evaluated against the query layer and the query layer in return
 // can access data written by the rules.
-func TestRuleComponent(t *testing.T) {
+func testRuleComponent(t *testing.T, sdConfig sdConfig) {
 	dir, err := ioutil.TempDir("", "test_rule")
 	testutil.Ok(t, err)
 	defer func() { testutil.Ok(t, os.RemoveAll(dir)) }()
@@ -46,12 +76,7 @@ groups:
 		numRules:         2,
 		numAlertmanagers: 1,
 		rules:            alwaysFireRule,
-		// sd config that mimics the previous behaviour. This config is properly used in the next PR
-		sdConfig: sdConfig{
-			useGossip:           true,
-			useStaticStoresFlag: false,
-			useFileSD:           false,
-		},
+		sdConfig:         sdConfig,
 	})
 	if err != nil {
 		t.Errorf("spinup failed: %v", err)
