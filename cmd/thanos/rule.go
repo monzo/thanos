@@ -77,6 +77,9 @@ func registerRule(m map[string]setupFunc, app *kingpin.Application, name string)
 	bucketConfFile := cmd.Flag("objstore.config-file", "The object store configuration file path.").
 		PlaceHolder("<bucket.config.path>").String()
 
+	queries := cmd.Flag("query", "Addresses of statically configured query API servers (repeatable).").
+		PlaceHolder("<query>").Strings()
+
 	filesToWatch := cmd.Flag("filesd", "Path to file that contain addresses of query peers (repeatable).").
 		PlaceHolder("<path>").Strings()
 
@@ -100,6 +103,15 @@ func registerRule(m map[string]setupFunc, app *kingpin.Application, name string)
 			Retention:        *tsdbRetention,
 			NoLockfile:       true,
 			WALFlushInterval: 30 * time.Second,
+		}
+
+		lookupQueries := map[string]struct{}{}
+		for _, q := range *queries {
+			if _, ok := lookupQueries[q]; ok {
+				return errors.Errorf("Address %s is duplicated for --query flag.", q)
+			}
+
+			lookupQueries[q] = struct{}{}
 		}
 
 		var filesd *discovery.FileDiscoverer
@@ -130,6 +142,7 @@ func registerRule(m map[string]setupFunc, app *kingpin.Application, name string)
 			tsdbOpts,
 			name,
 			alertQueryURL,
+			*queries,
 			filesd,
 		)
 	}
@@ -157,6 +170,7 @@ func runRule(
 	tsdbOpts *tsdb.Options,
 	component string,
 	alertQueryURL *url.URL,
+	queryAddrs []string,
 	fileSD *discovery.FileDiscoverer,
 ) error {
 	configSuccess := prometheus.NewGauge(prometheus.GaugeOpts{
@@ -170,6 +184,12 @@ func runRule(
 
 	reg.MustRegister(configSuccess)
 	reg.MustRegister(configSuccessTime)
+
+	for _, addr := range queryAddrs {
+		if addr == "" {
+			return errors.New("static querier address cannot be empty")
+		}
+	}
 
 	db, err := tsdb.Open(dataDir, log.With(logger, "component", "tsdb"), reg, tsdbOpts)
 	if err != nil {
@@ -192,6 +212,8 @@ func runRule(
 	// back or the context get canceled.
 	queryFn := func(ctx context.Context, q string, t time.Time) (promql.Vector, error) {
 		var addrs []string
+		// Add addresses from static flag
+		addrs = append(addrs, queryAddrs...)
 
 		// Add addresses from gossip
 		peers := peer.PeerStates(cluster.PeerTypeQuery)
