@@ -200,7 +200,7 @@ func runRule(
 		ctx, cancel := context.WithCancel(context.Background())
 		ctx = tracing.ContextWithTracer(ctx, tracer)
 
-		notify := func(ctx context.Context, expr string, alerts ...*rules.Alert) error {
+		notifyFn := func(ctx context.Context, expr string, alerts ...*rules.Alert) {
 			res := make([]*alert.Alert, 0, len(alerts))
 			for _, alrt := range alerts {
 				// Only send actually firing alerts.
@@ -219,13 +219,11 @@ func runRule(
 				res = append(res, a)
 			}
 			alertQ.Push(res)
-
-			return nil
 		}
 		mgr = rules.NewManager(&rules.ManagerOptions{
 			Context:     ctx,
 			QueryFunc:   queryFn,
-			NotifyFunc:  notify,
+			NotifyFunc:  notifyFn,
 			Logger:      log.With(logger, "component", "rules"),
 			Appendable:  tsdb.Adapter(db, 0),
 			Registerer:  reg,
