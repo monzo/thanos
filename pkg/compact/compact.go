@@ -1038,11 +1038,23 @@ func (c *BucketCompactor) Compact(ctx context.Context) error {
 		workCtxCancel()
 		if err != nil {
 			errMsgs := []string{err.Error()}
+
 			// Collect any other errors reported by the workers.
+			// Propagate a retriable error if all reported errors are retriable.
+			retriable := true
+
 			for e := range errChan {
 				errMsgs = append(errMsgs, e.Error())
+				if !IsRetryError(e) {
+					retriable = false
+				}
 			}
-			return errors.New(strings.Join(errMsgs, "; "))
+
+			err := errors.New(strings.Join(errMsgs, "; "))
+			if retriable {
+				err = retry(err)
+			}
+			return err
 		}
 
 		if finishedAllGroups {
