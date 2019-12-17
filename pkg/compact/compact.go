@@ -34,7 +34,7 @@ const (
 	ResolutionLevel5m  = ResolutionLevel(downsample.ResLevel1)
 	ResolutionLevel1h  = ResolutionLevel(downsample.ResLevel2)
 
-	MinimumAgeForRemoval = time.Duration(30 * time.Minute)
+	MinimumAgeForRemoval = time.Duration(24 * time.Hour)
 )
 
 var blockTooFreshSentinelError = errors.New("Block too fresh")
