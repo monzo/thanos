@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"github.com/prometheus/prometheus/pkg/relabel"
 	"os"
 	"path/filepath"
 	"time"
@@ -27,6 +28,7 @@ import (
 	"github.com/thanos-io/thanos/pkg/prober"
 	"github.com/thanos-io/thanos/pkg/runutil"
 	kingpin "gopkg.in/alecthomas/kingpin.v2"
+	promlables "github.com/prometheus/prometheus/pkg/labels"
 )
 
 func registerDownsample(m map[string]setupFunc, app *kingpin.Application) {
@@ -40,8 +42,10 @@ func registerDownsample(m map[string]setupFunc, app *kingpin.Application) {
 
 	objStoreConfig := regCommonObjStoreFlags(cmd, "", true)
 
+	selectorRelabelConf := regSelectorRelabelFlags(cmd)
+
 	m[comp.String()] = func(g *run.Group, logger log.Logger, reg *prometheus.Registry, tracer opentracing.Tracer, _ bool) error {
-		return runDownsample(g, logger, reg, *httpAddr, *dataDir, objStoreConfig, comp)
+		return runDownsample(g, logger, reg, *httpAddr, *dataDir, objStoreConfig, comp, selectorRelabelConf)
 	}
 }
 
@@ -76,6 +80,7 @@ func runDownsample(
 	dataDir string,
 	objStoreConfig *extflag.PathOrContent,
 	comp component.Component,
+	selectorRelabelConf *extflag.PathOrContent,
 ) error {
 	confContentYaml, err := objStoreConfig.Content()
 	if err != nil {
@@ -83,6 +88,16 @@ func runDownsample(
 	}
 
 	bkt, err := client.NewBucket(logger, confContentYaml, reg, component.Downsample.String())
+	if err != nil {
+		return err
+	}
+
+	relabelContentYaml, err := selectorRelabelConf.Content()
+	if err != nil {
+		return errors.Wrap(err, "get content of relabel configuration")
+	}
+
+	relabelConfig, err := parseRelabelConfig(relabelContentYaml)
 	if err != nil {
 		return err
 	}
@@ -106,13 +121,13 @@ func runDownsample(
 
 			level.Info(logger).Log("msg", "start first pass of downsampling")
 
-			if err := downsampleBucket(ctx, logger, metrics, bkt, dataDir); err != nil {
+			if err := downsampleBucket(ctx, logger, metrics, bkt, dataDir, relabelConfig); err != nil {
 				return errors.Wrap(err, "downsampling failed")
 			}
 
 			level.Info(logger).Log("msg", "start second pass of downsampling")
 
-			if err := downsampleBucket(ctx, logger, metrics, bkt, dataDir); err != nil {
+			if err := downsampleBucket(ctx, logger, metrics, bkt, dataDir, relabelConfig); err != nil {
 				return errors.Wrap(err, "downsampling failed")
 			}
 
@@ -137,6 +152,7 @@ func downsampleBucket(
 	metrics *DownsampleMetrics,
 	bkt objstore.Bucket,
 	dir string,
+	relabelConfig []*relabel.Config,
 ) error {
 	if err := os.RemoveAll(dir); err != nil {
 		return errors.Wrap(err, "clean working directory")
@@ -162,6 +178,15 @@ func downsampleBucket(
 		m, err := block.DownloadMeta(ctx, logger, bkt, id)
 		if err != nil {
 			return errors.Wrap(err, "download metadata")
+		}
+
+		// Check for block labels by relabeling.
+		// If output is empty, the block will be dropped.
+		lset := promlables.FromMap(m.Thanos.Labels)
+		processedLabels := relabel.Process(lset, relabelConfig...)
+		if processedLabels == nil {
+			level.Debug(logger).Log("msg", "downsampling: dropping block(drop in relabeling)", "block", id)
+			return nil
 		}
 
 		metas = append(metas, &m)

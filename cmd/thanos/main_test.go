@@ -89,7 +89,7 @@ func TestCleanupDownsampleCacheFolder(t *testing.T) {
 
 	metrics := newDownsampleMetrics(reg)
 	testutil.Equals(t, 0.0, promtest.ToFloat64(metrics.downsamples.WithLabelValues(compact.GroupKey(meta))))
-	testutil.Ok(t, downsampleBucket(ctx, logger, metrics, bkt, dir))
+	testutil.Ok(t, downsampleBucket(ctx, logger, metrics, bkt, dir, nil))
 	testutil.Equals(t, 1.0, promtest.ToFloat64(metrics.downsamples.WithLabelValues(compact.GroupKey(meta))))
 
 	_, err = os.Stat(dir)
