@@ -49,9 +49,8 @@ type CacheGenNumberLoader interface {
 
 // ResultsCacheConfig is the config for the results cache.
 type ResultsCacheConfig struct {
-	CacheConfig                cache.Config `yaml:"cache"`
-	Compression                string       `yaml:"compression"`
-	CacheQueryableSamplesStats bool         `yaml:"cache_queryable_samples_stats"`
+	CacheConfig cache.Config `yaml:"cache"`
+	Compression string       `yaml:"compression"`
 }
 
 // RegisterFlags registers flags.
@@ -59,7 +58,6 @@ func (cfg *ResultsCacheConfig) RegisterFlags(f *flag.FlagSet) {
 	cfg.CacheConfig.RegisterFlagsWithPrefix("frontend.", "", f)
 
 	f.StringVar(&cfg.Compression, "frontend.compression", "", "Use compression in results cache. Supported values are: 'snappy' and '' (disable compression).")
-	f.BoolVar(&cfg.CacheQueryableSamplesStats, "frontend.cache-queryable-samples-stats", false, "Cache Statistics queryable samples on results cache.")
 }
 
 func (cfg *ResultsCacheConfig) Validate(qCfg querier.Config) error {
@@ -68,10 +66,6 @@ func (cfg *ResultsCacheConfig) Validate(qCfg querier.Config) error {
 		// valid
 	default:
 		return errors.Errorf("unsupported compression type: %s", cfg.Compression)
-	}
-
-	if cfg.CacheQueryableSamplesStats && !qCfg.EnablePerStepStats {
-		return errors.New("frontend.cache-queryable-samples-stats may only be enabled in conjunction with querier.per-step-stats-enabled. Please set the latter")
 	}
 
 	return cfg.CacheConfig.Validate()
@@ -159,12 +153,11 @@ type resultsCache struct {
 	limits   Limits
 	splitter CacheSplitter
 
-	extractor                  Extractor
-	minCacheExtent             int64 // discard any cache extent smaller than this
-	merger                     Merger
-	cacheGenNumberLoader       CacheGenNumberLoader
-	shouldCache                ShouldCacheFn
-	cacheQueryableSamplesStats bool
+	extractor            Extractor
+	minCacheExtent       int64 // discard any cache extent smaller than this
+	merger               Merger
+	cacheGenNumberLoader CacheGenNumberLoader
+	shouldCache          ShouldCacheFn
 }
 
 // NewResultsCacheMiddleware creates results cache middleware from config.
@@ -198,34 +191,26 @@ func NewResultsCacheMiddleware(
 
 	return MiddlewareFunc(func(next Handler) Handler {
 		return &resultsCache{
-			logger:                     logger,
-			cfg:                        cfg,
-			next:                       next,
-			cache:                      c,
-			limits:                     limits,
-			merger:                     merger,
-			extractor:                  extractor,
-			minCacheExtent:             (5 * time.Minute).Milliseconds(),
-			splitter:                   splitter,
-			cacheGenNumberLoader:       cacheGenNumberLoader,
-			shouldCache:                shouldCache,
-			cacheQueryableSamplesStats: cfg.CacheQueryableSamplesStats,
+			logger:               logger,
+			cfg:                  cfg,
+			next:                 next,
+			cache:                c,
+			limits:               limits,
+			merger:               merger,
+			extractor:            extractor,
+			minCacheExtent:       (5 * time.Minute).Milliseconds(),
+			splitter:             splitter,
+			cacheGenNumberLoader: cacheGenNumberLoader,
+			shouldCache:          shouldCache,
 		}
 	}), c, nil
 }
 
 func (s resultsCache) Do(ctx context.Context, r Request) (Response, error) {
 	tenantIDs, err := tenant.TenantIDs(ctx)
-	respWithStats := r.GetStats() != "" && s.cacheQueryableSamplesStats
+	respWithStats := r.GetStats() != ""
 	if err != nil {
 		return nil, httpgrpc.Errorf(http.StatusBadRequest, err.Error())
-	}
-
-	// If cache_queryable_samples_stats is enabled we always need request the status upstream
-	if s.cacheQueryableSamplesStats {
-		r = r.WithStats("all")
-	} else {
-		r = r.WithStats("")
 	}
 
 	if s.shouldCache != nil && !s.shouldCache(r) {
@@ -447,6 +432,7 @@ func (s resultsCache) handleHit(ctx context.Context, r Request, extents []Extent
 	if len(requests) == 0 {
 		response, err := s.merger.MergeResponse(r, responses...)
 		// No downstream requests so no need to write back to the cache.
+		response.AddHeader("X-Thanos-Results-Cache", fmt.Sprintf("hit; extents=%d", len(extents)))
 		return response, nil, err
 	}
 
@@ -520,6 +506,8 @@ func (s resultsCache) handleHit(ctx context.Context, r Request, extents []Extent
 	}
 
 	response, err := s.merger.MergeResponse(r, responses...)
+	response.AddHeader("X-Thanos-Results-Cache", fmt.Sprintf("hit; extents=%d", len(extents)))
+
 	return response, mergedExtents, err
 }
 
@@ -704,7 +692,12 @@ func extractStats(start, end int64, stats *PrometheusResponseStats) *PrometheusR
 		return stats
 	}
 
-	result := &PrometheusResponseStats{Samples: &PrometheusResponseSamplesStats{}}
+	result := &PrometheusResponseStats{
+		Samples: &PrometheusResponseStats_Samples{
+			PeakSamples: stats.Samples.PeakSamples,
+		},
+		Timings: stats.Timings,
+	}
 	for _, s := range stats.Samples.TotalQueryableSamplesPerStep {
 		if start <= s.TimestampMs && s.TimestampMs <= end {
 			result.Samples.TotalQueryableSamplesPerStep = append(result.Samples.TotalQueryableSamplesPerStep, s)

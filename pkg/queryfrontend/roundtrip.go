@@ -78,6 +78,7 @@ func NewTripperware(config Config, reg prometheus.Registerer, logger log.Logger)
 		queryInstantCodec,
 		prometheus.WrapRegistererWith(prometheus.Labels{"tripperware": "query_instant"}, reg),
 		config.ForwardHeaders,
+		logger,
 	)
 	return func(next http.RoundTripper) http.RoundTripper {
 		tripper := newRoundTripper(
@@ -335,6 +336,7 @@ func newInstantQueryTripperware(
 	codec queryrange.Codec,
 	reg prometheus.Registerer,
 	forwardHeaders []string,
+	logger log.Logger,
 ) queryrange.Tripperware {
 	instantQueryMiddlewares := []queryrange.Middleware{}
 	m := queryrange.NewInstrumentMiddlewareMetrics(reg)

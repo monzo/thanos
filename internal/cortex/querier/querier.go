@@ -21,7 +21,6 @@ type Config struct {
 	QueryIngestersWithin      time.Duration `yaml:"query_ingesters_within"`
 	QueryStoreForLabels       bool          `yaml:"query_store_for_labels_enabled"`
 	AtModifierEnabled         bool          `yaml:"at_modifier_enabled"`
-	EnablePerStepStats        bool          `yaml:"per_step_stats_enabled"`
 
 	// QueryStoreAfter the time after which queries should also be sent to the store and not just ingesters.
 	QueryStoreAfter    time.Duration `yaml:"query_store_after"`

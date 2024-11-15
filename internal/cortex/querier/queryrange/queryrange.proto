@@ -84,12 +84,22 @@ message Matrix {
 }
 
 message PrometheusResponseStats {
-  PrometheusResponseSamplesStats samples = 1 [(gogoproto.jsontag) = "samples"];
-}
+  message Timings {
+    float EvalTotalTime = 1 [(gogoproto.jsontag) = "evalTotalTime"];
+    float ResultSortTime = 2 [(gogoproto.jsontag) = "resultSortTime"];
+    float QueryPreparationTime = 3 [(gogoproto.jsontag) = "queryPreparationTime"];
+    float InnerEvalTime = 4 [(gogoproto.jsontag) = "innerEvalTime"];
+    float ExecQueueTime = 5 [(gogoproto.jsontag) = "execQueueTime"];
+    float ExecTotalTime = 6 [(gogoproto.jsontag) = "execTotalTime"];
+  }
+  message Samples {
+    int64 TotalQueryableSamples = 1 [(gogoproto.jsontag) = "totalQueryableSamples"];
+    int64 PeakSamples = 2 [(gogoproto.jsontag) = "peakSamples"];
+    repeated PrometheusResponseQueryableSamplesStatsPerStep totalQueryableSamplesPerStep = 3 [(gogoproto.jsontag) = "totalQueryableSamplesPerStep"];
+  }
 
-message PrometheusResponseSamplesStats {
-  int64 totalQueryableSamples = 1 [(gogoproto.jsontag) = "totalQueryableSamples"];
-  repeated PrometheusResponseQueryableSamplesStatsPerStep totalQueryableSamplesPerStep = 2 [(gogoproto.jsontag) = "totalQueryableSamplesPerStep"];
+  Timings timings = 1 [(gogoproto.jsontag) = "timings"];
+  Samples samples = 2 [(gogoproto.jsontag) = "samples"];
 }
 
 message PrometheusResponseQueryableSamplesStatsPerStep {

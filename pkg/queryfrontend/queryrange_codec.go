@@ -128,6 +128,7 @@ func (c queryRangeCodec) DecodeRequest(_ context.Context, r *http.Request, forwa
 		return nil, err
 	}
 
+	result.Stats = r.FormValue("stats")
 	result.Query = r.FormValue("query")
 	result.Analyze = r.FormValue(queryv1.QueryAnalyzeParam)
 	result.Engine = r.FormValue(queryv1.EngineParam)
@@ -166,6 +167,7 @@ func (c queryRangeCodec) EncodeRequest(ctx context.Context, r queryrange.Request
 		queryv1.DedupParam:           []string{strconv.FormatBool(thanosReq.Dedup)},
 		queryv1.PartialResponseParam: []string{strconv.FormatBool(thanosReq.PartialResponse)},
 		queryv1.ReplicaLabelsParam:   thanosReq.ReplicaLabels,
+		"stats":                      []string{thanosReq.Stats},
 	}
 
 	if thanosReq.AutoDownsampling {

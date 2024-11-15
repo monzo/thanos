@@ -107,6 +107,8 @@ type Response interface {
 	GetHeaders() []*PrometheusResponseHeader
 	// GetStats returns the Prometheus query stats in the response.
 	GetStats() *PrometheusResponseStats
+	// AddHeader adds a HTTP header to the response
+	AddHeader(key, value string)
 }
 
 type prometheusCodec struct{}
@@ -184,6 +186,14 @@ func (resp *PrometheusInstantQueryResponse) GetStats() *PrometheusResponseStats 
 	return resp.Data.Stats
 }
 
+func (resp *PrometheusResponse) AddHeader(key, value string) {
+	resp.Headers = append(resp.Headers, &PrometheusResponseHeader{Name: key, Values: []string{value}})
+}
+
+func (resp *PrometheusInstantQueryResponse) AddHeader(key, value string) {
+	resp.Headers = append(resp.Headers, &PrometheusResponseHeader{Name: key, Values: []string{value}})
+}
+
 // NewEmptyPrometheusResponse returns an empty successful Prometheus query range response.
 func NewEmptyPrometheusResponse() *PrometheusResponse {
 	return &PrometheusResponse{
@@ -217,9 +227,25 @@ func (prometheusCodec) MergeResponse(_ Request, responses ...Response) (Response
 	// we need to pass on all the headers for results cache gen numbers.
 	var resultsCacheGenNumberHeaderValues []string
 
+	var headers []*PrometheusResponseHeader
+	// merge headers
 	for _, res := range responses {
 		promResponses = append(promResponses, res.(*PrometheusResponse))
 		resultsCacheGenNumberHeaderValues = append(resultsCacheGenNumberHeaderValues, getHeaderValuesWithName(res, ResultsCacheGenNumberHeaderName)...)
+		for _, newHeader := range res.GetHeaders() {
+			found := false
+			for _, existing := range headers {
+				if existing.Name == newHeader.Name {
+					// if headers match, overwrite with the new header
+					existing = newHeader
+					found = true
+				}
+			}
+			if !found {
+				// new header doesn't exist in existing list, so add it
+				headers = append(headers, newHeader)
+			}
+		}
 	}
 
 	// Merge the responses.
@@ -244,10 +270,14 @@ func (prometheusCodec) MergeResponse(_ Request, responses ...Response) (Response
 	}
 
 	if len(resultsCacheGenNumberHeaderValues) != 0 {
-		response.Headers = []*PrometheusResponseHeader{{
+		response.Headers = append(response.Headers, &PrometheusResponseHeader{
 			Name:   ResultsCacheGenNumberHeaderName,
 			Values: resultsCacheGenNumberHeaderValues,
-		}}
+		})
+	}
+
+	for _, h := range headers {
+		response.Headers = append(response.Headers, h)
 	}
 
 	return &response, nil
@@ -418,6 +448,16 @@ func (prometheusCodec) EncodeResponse(ctx context.Context, res Response) (*http.
 		Body:          io.NopCloser(bytes.NewBuffer(b)),
 		StatusCode:    http.StatusOK,
 		ContentLength: int64(len(b)),
+	}
+
+	// Copy Prometheus headers into http response
+	for _, h := range a.Headers {
+		for _, v := range h.Values {
+			if strings.HasPrefix(h.Name, "X-") {
+				// Only copy X- headers, otherwise we might corrupt HTTP protocol headers (like Content-Length)
+				resp.Header.Add(h.Name, v)
+			}
+		}
 	}
 	return &resp, nil
 }
@@ -665,6 +705,23 @@ func (s *PrometheusInstantQueryData) MarshalJSON() ([]byte, error) {
 func StatsMerge(resps []Response) *PrometheusResponseStats {
 	output := map[int64]*PrometheusResponseQueryableSamplesStatsPerStep{}
 	hasStats := false
+
+	result := &PrometheusResponseStats{
+		Timings: &PrometheusResponseStats_Timings{
+			EvalTotalTime:        0,
+			ResultSortTime:       0,
+			QueryPreparationTime: 0,
+			InnerEvalTime:        0,
+			ExecQueueTime:        0,
+			ExecTotalTime:        0,
+		},
+		Samples: &PrometheusResponseStats_Samples{
+			TotalQueryableSamples:        0,
+			PeakSamples:                  0,
+			TotalQueryableSamplesPerStep: []*PrometheusResponseQueryableSamplesStatsPerStep{},
+		},
+	}
+
 	for _, resp := range resps {
 		stats := resp.GetStats()
 		if stats == nil {
@@ -679,6 +736,19 @@ func StatsMerge(resps []Response) *PrometheusResponseStats {
 		for _, s := range stats.Samples.TotalQueryableSamplesPerStep {
 			output[s.GetTimestampMs()] = s
 		}
+
+		// add all the stats
+		result.Timings.EvalTotalTime += stats.Timings.EvalTotalTime
+		result.Timings.ResultSortTime += stats.Timings.ResultSortTime
+		result.Timings.QueryPreparationTime += stats.Timings.QueryPreparationTime
+		result.Timings.InnerEvalTime += stats.Timings.InnerEvalTime
+		result.Timings.ExecQueueTime += stats.Timings.ExecQueueTime
+		result.Timings.ExecTotalTime += stats.Timings.ExecTotalTime
+
+		result.Samples.TotalQueryableSamples += stats.Samples.TotalQueryableSamples
+		if stats.Samples.PeakSamples > result.Samples.PeakSamples {
+			result.Samples.PeakSamples = stats.Samples.PeakSamples
+		}
 	}
 
 	if !hasStats {
@@ -692,10 +762,8 @@ func StatsMerge(resps []Response) *PrometheusResponseStats {
 
 	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
 
-	result := &PrometheusResponseStats{Samples: &PrometheusResponseSamplesStats{}}
 	for _, key := range keys {
 		result.Samples.TotalQueryableSamplesPerStep = append(result.Samples.TotalQueryableSamplesPerStep, output[key])
-		result.Samples.TotalQueryableSamples += output[key].Value
 	}
 
 	return result

@@ -64,3 +64,7 @@ func (m *ThanosLabelsResponse) GetStats() *queryrange.PrometheusResponseStats {
 func (m *ThanosSeriesResponse) GetStats() *queryrange.PrometheusResponseStats {
 	return nil
 }
+
+func (m *ThanosSeriesResponse) AddHeader(key, value string) {}
+
+func (m *ThanosLabelsResponse) AddHeader(key, value string) {}

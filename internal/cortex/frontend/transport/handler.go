@@ -6,10 +6,8 @@ package transport
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/prometheus/util/stats"
 	"io"
 	"net/http"
@@ -44,7 +42,6 @@ var (
 type HandlerConfig struct {
 	LogQueriesLongerThan time.Duration `yaml:"log_queries_longer_than"`
 	MaxBodySize          int64         `yaml:"max_body_size"`
-	QueryStatsEnabled    bool          `yaml:"query_stats_enabled"`
 }
 
 // Handler accepts queries and forwards them to RoundTripper. It can log slow queries,
@@ -66,27 +63,6 @@ func NewHandler(cfg HandlerConfig, roundTripper http.RoundTripper, log log.Logge
 		cfg:          cfg,
 		log:          log,
 		roundTripper: roundTripper,
-	}
-
-	if cfg.QueryStatsEnabled {
-		h.querySeconds = promauto.With(reg).NewHistogramVec(prometheus.HistogramOpts{
-			Name:    "thanos_query_frontend_query_seconds",
-			Help:    "Total amount of wall clock time spend processing queries.",
-			Buckets: []float64{0.01, 0.1, 0.5, 1, 2, 5, 10, 30, 60, 120, 360},
-		}, []string{"user"})
-
-		h.querySamplesTotal = promauto.With(reg).NewHistogramVec(prometheus.HistogramOpts{
-			Name:    "thanos_query_frontend_query_total_fetched_samples",
-			Help:    "Number of samples touched to execute a query.",
-			Buckets: []float64{1, 100, 1000, 10000, 100000, 1000000, 10000000, 100000000},
-		}, []string{"user"})
-
-		h.activeUsers = util.NewActiveUsersCleanupWithDefaultValues(func(user string) {
-			h.querySeconds.DeleteLabelValues(user)
-			h.querySamplesTotal.DeleteLabelValues(user)
-		})
-		// If cleaner stops or fail, we will simply not clean the metrics for inactive users.
-		_ = h.activeUsers.StartAsync(context.Background())
 	}
 
 	return h
@@ -129,38 +105,15 @@ func (f *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(resp.StatusCode)
 
-	var respBuf bytes.Buffer
-	if f.cfg.QueryStatsEnabled {
-		// Buffer the response body for query stat tracking later
-		resp.Body = io.NopCloser(io.TeeReader(resp.Body, &respBuf))
-	}
-
 	// log copy response body error so that we will know even though success response code returned
 	bytesCopied, err := io.Copy(w, resp.Body)
 	if err != nil && !errors.Is(err, syscall.EPIPE) {
 		level.Error(util_log.WithContext(r.Context(), f.log)).Log("msg", "write response body error", "bytesCopied", bytesCopied, "err", err)
 	}
 
-	if f.cfg.QueryStatsEnabled {
-		// Parse the stats field out of the response body
-		var statsResponse ResponseWithStats
-		if err := json.Unmarshal(respBuf.Bytes(), &statsResponse); err == nil {
-			if statsResponse.Data.Stats != nil {
-				queryString = f.parseRequestQueryString(r, buf)
-				f.reportQueryStats(r, queryString, queryResponseTime, statsResponse.Data.Stats)
-			} else {
-				// Don't fail the request if the stats are nil, just log a warning
-				level.Warn(util_log.WithContext(r.Context(), f.log)).Log("msg", "error parsing query stats", "err", errors.New("stats are nil"))
-			}
-		} else {
-			// Don't fail the request if the stats are nil, just log a warning
-			level.Warn(util_log.WithContext(r.Context(), f.log)).Log("msg", "error parsing query stats", "err", err)
-		}
-	}
-
 	// Check whether we should parse the query string.
 	shouldReportSlowQuery := f.cfg.LogQueriesLongerThan != 0 && queryResponseTime > f.cfg.LogQueriesLongerThan
-	if shouldReportSlowQuery || f.cfg.QueryStatsEnabled {
+	if shouldReportSlowQuery {
 		queryString = f.parseRequestQueryString(r, buf)
 	}
 
@@ -201,47 +154,6 @@ func (f *Handler) reportSlowQuery(r *http.Request, responseHeaders http.Header, 
 	}, formatQueryString(queryString)...)
 
 	level.Info(util_log.WithContext(r.Context(), f.log)).Log(logMessage...)
-}
-
-func (f *Handler) reportQueryStats(r *http.Request, queryString url.Values, queryResponseTime time.Duration, stats *stats.BuiltinStats) {
-	remoteUser, _, _ := r.BasicAuth()
-
-	// Log stats.
-	logMessage := []interface{}{
-		"msg", "query stats",
-		"component", "query-frontend",
-		"method", r.Method,
-		"path", r.URL.Path,
-		"remote_user", remoteUser,
-		"remote_addr", r.RemoteAddr,
-		"response_time", queryResponseTime,
-		"query_timings_preparation_time", stats.Timings.QueryPreparationTime,
-		"query_timings_eval_total_time", stats.Timings.EvalTotalTime,
-		"query_timings_exec_total_time", stats.Timings.ExecTotalTime,
-		"query_timings_exec_queue_time", stats.Timings.ExecQueueTime,
-		"query_timings_inner_eval_time", stats.Timings.InnerEvalTime,
-		"query_timings_result_sort_time", stats.Timings.ResultSortTime,
-	}
-	if stats.Samples != nil {
-		samples := stats.Samples
-
-		logMessage = append(logMessage, []interface{}{
-			"total_queryable_samples", samples.TotalQueryableSamples,
-			"peak_samples", samples.PeakSamples,
-		}...)
-	}
-
-	logMessage = append(logMessage, formatQueryString(queryString)...)
-
-	level.Info(util_log.WithContext(r.Context(), f.log)).Log(logMessage...)
-
-	// Record metrics.
-	if f.querySeconds != nil {
-		f.querySeconds.WithLabelValues(remoteUser).Observe(queryResponseTime.Seconds())
-	}
-	if f.querySamplesTotal != nil && stats.Samples != nil {
-		f.querySamplesTotal.WithLabelValues(remoteUser).Observe(float64(stats.Samples.TotalQueryableSamples))
-	}
 }
 
 func (f *Handler) parseRequestQueryString(r *http.Request, bodyBuf bytes.Buffer) url.Values {
